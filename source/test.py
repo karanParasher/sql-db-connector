@@ -1,14 +1,13 @@
 import os
 import sys
-import pandas as pd
 import configparser
+from pyspark.sql import Row
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
 # Import the GenericJDBCConnector class
-# Assuming generic_jdbc_connector.py is in the same directory as test.py
 from generic_jdbc_connector import GenericJDBCConnector
 
 # --- IMPORTANT: Configure PySpark Python executable paths before SparkSession creation ---
-# Get the path to the current Python interpreter being used to run this script
 python_executable_path = sys.executable
 os.environ['PYSPARK_PYTHON'] = python_executable_path
 os.environ['PYSPARK_DRIVER_PYTHON'] = python_executable_path
@@ -17,15 +16,13 @@ print(f"Set PYSPARK_PYTHON and PYSPARK_DRIVER_PYTHON to: {python_executable_path
 
 if __name__ == "__main__":
     config = configparser.ConfigParser()
-    
     config_file_path = "config.cfg"
-
     config.read(config_file_path)
 
     DB_TYPE = config.get('DEFAULT', 'DEFAULT_DB_TYPE', fallback='SQLSERVER')
     DRIVERS_FOLDER_NAME = config.get('DEFAULT', 'DRIVERS_FOLDER_NAME', fallback='drivers')
     DRIVERS_FOLDER_PATH = "drivers"
-    
+
     try:
         db_config = config[DB_TYPE]
         DB_URL = db_config['DB_URL']
@@ -33,8 +30,7 @@ if __name__ == "__main__":
         DB_PASSWORD = db_config['DB_PASSWORD']
         JDBC_DRIVER_CLASS = db_config['JDBC_DRIVER_CLASS']
         JDBC_DRIVER_FILENAME = db_config['JDBC_DRIVER_FILENAME']
-        
-        # Ensure JDBC_DRIVER_PATH is always an absolute path using os.path.join
+
         JDBC_DRIVER_PATH = os.path.join(DRIVERS_FOLDER_PATH, JDBC_DRIVER_FILENAME)
 
     except KeyError as e:
@@ -42,13 +38,14 @@ if __name__ == "__main__":
         print("Please ensure your 'config.cfg' is correctly set up and all required keys are present.")
         sys.exit(1)
 
-
     print(f"\n--- Testing with {DB_TYPE} ---")
     print(f"Using JDBC Driver Path: {JDBC_DRIVER_PATH}")
     print(f"Connecting to URL: {DB_URL}")
-    
+
     try:
         with GenericJDBCConnector(DB_URL, DB_USER, DB_PASSWORD, JDBC_DRIVER_CLASS, JDBC_DRIVER_PATH) as db:
+            spark_session = db.spark # Get the SparkSession for creating DataFrames
+
             # --- Test Execute (Create Table) ---
             print("\n--- Test Execute (Create Table) ---")
             if DB_TYPE == "SQLSERVER":
@@ -93,75 +90,70 @@ if __name__ == "__main__":
             print("\n--- Test Insert ---")
             db.insert('TestTable', {'Name': 'Alice', 'Age': 30, 'City': 'New York'})
             db.insert('TestTable', {'Name': 'Bob', 'Age': 24, 'City': 'London'})
-            
-            # FIX: Explicitly cast CreatedOn to VARCHAR in SQL query for SQL Server
+
             if DB_TYPE == "SQLSERVER":
                 df_after_insert = db.read("SELECT ID, Name, Age, City, CAST(CreatedOn AS VARCHAR(50)) AS CreatedOn FROM TestTable")
             else:
                 df_after_insert = db.read("SELECT * FROM TestTable")
 
-            if not df_after_insert.empty:
+            if df_after_insert.count() > 0:
                 print("Data after initial inserts:")
-                # Ensure 'ID' column exists before attempting to sort
-                if 'ID' in df_after_insert.columns:
-                    df_after_insert = df_after_insert.sort_values(by='ID')
-                print(df_after_insert)
+                # Spark DataFrames do not have sort_values directly. Use orderBy.
+                df_after_insert.orderBy('ID').show()
             else:
                 print("No data after initial inserts to display.")
 
             # --- Test Update ---
             print("\n--- Test Update ---")
             db.update('TestTable', {'Age': 31}, "Name = 'Alice'")
-            
-            # FIX: Explicitly cast CreatedOn to VARCHAR in SQL query for SQL Server
+
             if DB_TYPE == "SQLSERVER":
                 df_after_update = db.read("SELECT ID, Name, Age, City, CAST(CreatedOn AS VARCHAR(50)) AS CreatedOn FROM TestTable WHERE Name = 'Alice'")
             else:
                 df_after_update = db.read("SELECT * FROM TestTable WHERE Name = 'Alice'")
 
-            if not df_after_update.empty:
+            if df_after_update.count() > 0:
                 print("Data after update:")
-                # Ensure 'ID' column exists before attempting to sort
-                if 'ID' in df_after_update.columns:
-                    df_after_update = df_after_update.sort_values(by='ID')
-                print(df_after_update)
+                df_after_update.orderBy('ID').show()
             else:
                 print("No data after update for Alice to display.")
 
             # --- Test Bulk Upsert ---
             print("\n--- Test Bulk Upsert ---")
-            data_to_upsert = {
-                'Name': ['Alice', 'Charlie', 'David'],
-                'Age': [32, 28, 35],
-                'City': ['New York', 'Paris', 'Berlin']
-            }
-            df_upsert = pd.DataFrame(data_to_upsert)
-            
-            db.bulk_upsert('TestTable', df_upsert, on_cols=['Name'])
-            
-            # FIX: Explicitly cast CreatedOn to VARCHAR in SQL query for SQL Server
+            # Create a Spark DataFrame directly
+            data_to_upsert = [
+                Row(Name='Alice', Age=32, City='New York'),
+                Row(Name='Charlie', Age=28, City='Paris'),
+                Row(Name='David', Age=35, City='Berlin')
+            ]
+            # Define schema for creating DataFrame
+            schema = StructType([
+                StructField("Name", StringType(), True),
+                StructField("Age", IntegerType(), True),
+                StructField("City", StringType(), True)
+            ])
+            df_upsert_spark = spark_session.createDataFrame(data_to_upsert, schema=schema)
+
+            db.bulk_upsert('TestTable', df_upsert_spark, on_cols=['Name'])
+
             if DB_TYPE == "SQLSERVER":
                 df_after_bulk_upsert = db.read("SELECT ID, Name, Age, City, CAST(CreatedOn AS VARCHAR(50)) AS CreatedOn FROM TestTable")
             else:
                 df_after_bulk_upsert = db.read("SELECT * FROM TestTable")
 
-            # Added check for empty DataFrame before sorting
-            if not df_after_bulk_upsert.empty and 'ID' in df_after_bulk_upsert.columns:
-                df_after_bulk_upsert = df_after_bulk_upsert.sort_values(by='ID') # Sort in Pandas for display
+            if df_after_bulk_upsert.count() > 0:
                 print("Data after bulk upsert:")
-                print(df_after_bulk_upsert)
+                df_after_bulk_upsert.orderBy('ID').show()
             else:
-                print("No data after bulk upsert to display or 'ID' column not found for sorting.")
-
+                print("No data after bulk upsert to display.")
 
             # --- Test Stream Read ---
             print("\n--- Test Stream Read ---")
-            # FIX: Explicitly cast CreatedOn to VARCHAR in SQL query for SQL Server
             stream_read_query = "SELECT ID, Name, Age, City, CAST(CreatedOn AS VARCHAR(50)) AS CreatedOn FROM TestTable" if DB_TYPE == "SQLSERVER" else "SELECT * FROM TestTable"
             for i, chunk_df in enumerate(db.stream_read(stream_read_query, chunk_size=2)):
-                if not chunk_df.empty:
+                if chunk_df.count() > 0:
                     print(f"\nStreamed Chunk {i+1}:")
-                    print(chunk_df)
+                    chunk_df.show()
                 else:
                     print(f"\nStreamed Chunk {i+1}: (Empty)")
                 if i >= 1: # Limit to 2 chunks for brevity
@@ -169,9 +161,7 @@ if __name__ == "__main__":
 
             # --- Test Call Procedure ---
             print("\n--- Test Call Procedure ---")
-            # Create stored procedure
             if DB_TYPE == "SQLSERVER":
-                # Ensure statements are split to avoid 'GO' syntax error
                 db.execute("""
                     IF OBJECT_ID('sp_UpdateAgeByName', 'P') IS NOT NULL
                         DROP PROCEDURE sp_UpdateAgeByName;
@@ -208,33 +198,32 @@ if __name__ == "__main__":
             print(f"Stored procedure 'sp_UpdateAgeByName' created for {DB_TYPE}.")
 
             db.call_procedure('sp_UpdateAgeByName', ('Alice', 40))
-            # FIX: Explicitly cast CreatedOn to VARCHAR in SQL query for SQL Server
+
             if DB_TYPE == "SQLSERVER":
                 df_proc_updated = db.read("SELECT ID, Name, Age, City, CAST(CreatedOn AS VARCHAR(50)) AS CreatedOn FROM TestTable WHERE Name = 'Alice'")
             else:
                 df_proc_updated = db.read("SELECT * FROM TestTable WHERE Name = 'Alice'")
 
-            if not df_proc_updated.empty:
+            if df_proc_updated.count() > 0:
                 print("Data after calling procedure:")
-                print(df_proc_updated)
+                df_proc_updated.show()
             else:
                 print("No data after procedure call to display.")
 
             # --- Test Execute (Delete Table) ---
             print("\n--- Test Execute (Delete Table) ---")
             db.execute("DELETE FROM TestTable WHERE Name = 'Bob'")
-            # FIX: Explicitly cast CreatedOn to VARCHAR in SQL query for SQL Server
+
             if DB_TYPE == "SQLSERVER":
                 df_after_delete = db.read("SELECT ID, Name, Age, City, CAST(CreatedOn AS VARCHAR(50)) AS CreatedOn FROM TestTable")
             else:
                 df_after_delete = db.read("SELECT * FROM TestTable")
 
-            if not df_after_delete.empty and 'ID' in df_after_delete.columns:
-                df_after_delete = df_after_delete.sort_values(by='ID') # Sort in Pandas for display
+            if df_after_delete.count() > 0:
                 print("Data after delete:")
-                print(df_after_delete)
+                df_after_delete.orderBy('ID').show()
             else:
-                print("No data after delete to display or 'ID' column not found for sorting.")
+                print("No data after delete to display.")
 
             # --- Test Execute (Drop Table) ---
             print("\n--- Test Execute (Drop Table) ---")

@@ -1,15 +1,11 @@
 import os
-import sys # Import sys to get the current interpreter path
-import pandas as pd
 from typing import List, Dict, Any, Generator, Tuple
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit
-import configparser # Import the configparser module
+from pyspark.sql import SparkSession, DataFrame
 
 os.environ["PYSPARK_SUBMIT_ARGS"] = (
     "--driver-java-options=--add-opens=java.base/java.nio=ALL-UNNAMED "
     "--conf spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED pyspark-shell"
-) # To supress the uneccesary warning which making noise
+)
 
 from database_connector import DatabaseConnector
 
@@ -17,7 +13,8 @@ class GenericJDBCConnector(DatabaseConnector):
     """
     A generic class to handle database operations using PySpark's JDBC capabilities.
     Supports various databases (MySQL, SQL Server, PostgreSQL, etc.) by specifying
-    the correct JDBC URL, driver, and driver path.
+    the correct JDBC URL, driver, and driver path. All operations now work
+    exclusively with PySpark DataFrames.
     """
 
     def __init__(self, db_url: str, db_user: str, db_password: str,
@@ -47,14 +44,12 @@ class GenericJDBCConnector(DatabaseConnector):
         Initializes or retrieves the SparkSession configured for JDBC.
         """
         try:
-            # Ensure the driver JAR path is accessible
             if not os.path.exists(self.jdbc_driver_path):
                 print(f"ERROR: JDBC driver JAR not found at: {self.jdbc_driver_path}")
                 raise FileNotFoundError(f"JDBC driver JAR missing: {self.jdbc_driver_path}")
 
             print(f"Attempting to initialize SparkSession with JDBC driver from: {self.jdbc_driver_path}")
-            
-            # Using 'spark.jars' is often more robust for adding external JARs
+
             self.spark = SparkSession.builder \
                 .appName("Generic JDBC Connector") \
                 .config("spark.jars", self.jdbc_driver_path) \
@@ -85,49 +80,65 @@ class GenericJDBCConnector(DatabaseConnector):
             "driver": self.jdbc_driver_class
         }
 
-    def read(self, query: str) -> pd.DataFrame:
-       
+    def read(self, query: str) -> DataFrame: # Return type is Spark DataFrame
+        """
+        Executes a SELECT query and returns the result as a PySpark DataFrame.
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
-            return pd.DataFrame()
+            return self.spark.createDataFrame([], schema=[]) # Return empty Spark DataFrame
+
         try:
-            # For "dbtable", query must be a valid SQL subquery wrapped in parentheses
-            # and given an alias.
             df = self.spark.read.format("jdbc").options(**self._get_jdbc_options()) \
                 .option("dbtable", f"({query}) AS custom_query") \
                 .load()
-            return df.toPandas()
+            return df
         except Exception as e:
             print(f"Error reading from database with Spark: {e}")
-            return pd.DataFrame()
+            raise # Re-raise the exception
 
-    def stream_read(self, query: str, chunk_size: int = 1000) -> Generator[pd.DataFrame, None, None]:
+    def stream_read(self, query: str, chunk_size: int = 1000) -> Generator[DataFrame, None, None]: # Return type is Spark DataFrame
+        """
+        Executes a SELECT query and streams results in chunks as PySpark DataFrames.
+        Note: PySpark's JDBC read does not directly support 'fetchsize' for true streaming
+        in the sense of returning partial Spark DataFrames in a generator.
+        This implementation will load the full data and then yield chunks from it.
+        For very large datasets, consider external streaming mechanisms or
+        more advanced Spark connectors.
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
             return
 
         try:
+            # Load the full DataFrame (Spark's JDBC read typically loads all data unless specific options are used)
             df_spark = self.spark.read.format("jdbc").options(**self._get_jdbc_options()) \
                 .option("dbtable", f"({query}) AS custom_query") \
-                .option("fetchsize", chunk_size) \
                 .load()
 
-            df_pandas = df_spark.toPandas()
-            for i in range(0, len(df_pandas), chunk_size):
-                yield df_pandas.iloc[i:i + chunk_size]
+            # Convert to RDD and then partition for "chunking"
+            # This simulates chunking from a loaded Spark DataFrame
+            rows = df_spark.collect() # Collects all data to driver memory, can be an issue for very large datasets
+            for i in range(0, len(rows), chunk_size):
+                chunk_rows = rows[i:i + chunk_size]
+                yield self.spark.createDataFrame(chunk_rows, df_spark.schema)
 
         except Exception as e:
             print(f"Error streaming from database with Spark: {e}")
-            return
+            raise # Re-raise the exception
 
     def insert(self, table_name: str, data: Dict[str, Any]):
+        """
+        Inserts a single row (represented as a dictionary) into the specified table.
+        Converts the dictionary to a Spark DataFrame for insertion.
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
             return
 
         try:
-            pdf = pd.DataFrame([data])
-            df_spark = self.spark.createDataFrame(pdf.to_dict(orient='records'))
+            # Create a Spark DataFrame from the single dictionary row
+            df_spark = self.spark.createDataFrame([data])
 
             df_spark.write.format("jdbc").options(**self._get_jdbc_options()) \
                 .option("dbtable", table_name) \
@@ -138,27 +149,32 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error inserting into {table_name} with Spark: {e}")
             raise
 
-    def bulk_upsert(self, table_name: str, df: pd.DataFrame, on_cols: List[str]):
+    def bulk_upsert(self, table_name: str, df: DataFrame, on_cols: List[str]): # Accepts Spark DataFrame
+        """
+        Performs a bulk upsert (INSERT or UPDATE) operation using Spark.
+        This will leverage Spark's DataFrameWriter for bulk writes and potential temporary tables/merge.
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
             return
 
-        if df.empty:
+        if df.count() == 0: # Check if Spark DataFrame is empty
             print("DataFrame is empty. No bulk upsert performed.")
             return
 
-        df_spark = self.spark.createDataFrame(df.to_dict(orient='records'))
-        
         # Staging table name
-        staging_table_name = f"spark_staging_{table_name}_{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}"
+        # Use a more robust way to get a unique identifier, e.g., current timestamp
+        from datetime import datetime
+        staging_table_name = f"spark_staging_{table_name}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
         try:
             print(f"Writing data to staging table: {staging_table_name}")
-            df_spark.write.format("jdbc").options(**self._get_jdbc_options()) \
+            df.write.format("jdbc").options(**self._get_jdbc_options()) \
                 .option("dbtable", staging_table_name) \
                 .mode("overwrite") \
                 .save()
- 
-            columns = ', '.join([f'"{col}"' for col in df.columns]) # Quoting columns for safety
+
+            columns = ', '.join([f'"{col}"' for col in df.columns])
             match_conditions = ' AND '.join([f'T."{col}" = S."{col}"' for col in on_cols])
             update_assignments = ', '.join([f'T."{col}" = S."{col}"' for col in df.columns if col not in on_cols])
             insert_values = ', '.join([f'S."{col}"' for col in df.columns])
@@ -173,54 +189,62 @@ class GenericJDBCConnector(DatabaseConnector):
                 INSERT ({columns})
                 VALUES ({insert_values});
             """
-            
+
             # Execute the MERGE statement
             self.execute(merge_sql)
-            print(f"Bulk upserted {len(df)} rows into {table_name} using MERGE via staging table.")
+            print(f"Bulk upserted {df.count()} rows into {table_name} using MERGE via staging table.")
 
         except Exception as e:
             print(f"Error during bulk upsert for {table_name}: {e}")
-            raise # Re-raise the exception after printing
+            raise
         finally:
             # Clean up the staging table
             try:
-                self.execute(f"DROP TABLE \"{staging_table_name}\"") # Quote table name for safety
+                self.execute(f"DROP TABLE \"{staging_table_name}\"")
                 print(f"Staging table {staging_table_name} dropped.")
             except Exception as e:
                 print(f"Error dropping staging table {staging_table_name}: {e}")
 
-
     def update(self, table_name: str, set_data: Dict[str, Any], where_clause: str):
+        """
+        Updates rows in the specified table.
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
             return
 
-        set_statements = ', '.join([f'"{col}" = {repr(value)}' if isinstance(value, str) else f'"{col}" = {value}'
-                                    for col, value in set_data.items()])
-        
-        sql_statement = f"UPDATE \"{table_name}\" SET {set_statements} WHERE {where_clause}"
+        # Prepare set statements for SQL
+        set_statements = []
+        for col, value in set_data.items():
+            if isinstance(value, str):
+                set_statements.append(f'"{col}" = \'{value}\'') # Enclose string values in single quotes
+            else:
+                set_statements.append(f'"{col}" = {value}')
+        set_clause = ', '.join(set_statements)
+
+        sql_statement = f"UPDATE \"{table_name}\" SET {set_clause} WHERE {where_clause}"
         try:
             self.execute(sql_statement)
             print(f"Successfully updated rows in {table_name}.")
         except Exception as e:
             print(f"Error updating {table_name}: {e}")
-            raise # Re-raise
+            raise
 
     def execute(self, sql_statement: str, params: Tuple[Any, ...] = ()):
+        """
+        Executes a generic SQL statement (e.g., CREATE, ALTER, DELETE, DROP, CALL PROCEDURE).
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
             return
 
         try:
-            # Access the Java JDBC API through PySpark's JVM bridge
             jdbcm = self.spark._jvm.java.sql.DriverManager
             conn = jdbcm.getConnection(self.db_url, self.db_user, self.db_password)
-            
+
             if params:
-                # Use PreparedStatement for parameterized queries
                 pstmt = conn.prepareStatement(sql_statement)
                 for i, param in enumerate(params):
-                    # Basic type mapping; extend as needed
                     if isinstance(param, int):
                         pstmt.setInt(i + 1, param)
                     elif isinstance(param, float):
@@ -237,28 +261,30 @@ class GenericJDBCConnector(DatabaseConnector):
                 stmt = conn.createStatement()
                 stmt.execute(sql_statement)
                 stmt.close()
-            
+
             conn.close()
             print(f"Successfully executed SQL statement: {sql_statement[:50]}...")
         except Exception as e:
             print(f"Error executing SQL statement: {e}")
-            raise # Re-raise the exception
+            raise
 
     def call_procedure(self, procedure_name: str, params: Tuple[Any, ...] = ()):
+        """
+        Calls a stored procedure.
+        """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
             return
 
         placeholders = ', '.join(['?' for _ in params])
         call_sql = f"{{CALL {procedure_name}({placeholders})}}" if params else f"{{CALL {procedure_name}}}"
-        
+
         try:
             jdbcm = self.spark._jvm.java.sql.DriverManager
             conn = jdbcm.getConnection(self.db_url, self.db_user, self.db_password)
-            
+
             cstmt = conn.prepareCall(call_sql)
             for i, param in enumerate(params):
-                # Basic type mapping; extend as needed
                 if isinstance(param, int):
                     cstmt.setInt(i + 1, param)
                 elif isinstance(param, float):
@@ -269,14 +295,14 @@ class GenericJDBCConnector(DatabaseConnector):
                     cstmt.setBoolean(i + 1, param)
                 else:
                     cstmt.setObject(i + 1, param)
-            
+
             cstmt.execute()
             cstmt.close()
             conn.close()
             print(f"Successfully called procedure '{procedure_name}'.")
         except Exception as e:
             print(f"Error calling procedure '{procedure_name}': {e}")
-            raise # Re-raise the exception
+            raise
 
     def __enter__(self):
         """Context manager entry point."""
