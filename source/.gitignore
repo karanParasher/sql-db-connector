@@ -1,0 +1,33 @@
+# General Python artifacts
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+.Python/
+build/
+dist/
+*.egg-info/
+.env/  # Virtual environment directory
+venv/  # Virtual environment directory
+
+# IDE specific files
+.idea/  # IntelliJ IDEA / PyCharm
+.vscode/ # VS Code
+*.iml
+
+# Spark related temporary/output directories
+spark-warehouse/
+.sparkStaging/
+spark-events/
+*.csv.crc # Checksum files for CSV in HDFS/Spark
+
+# Logs
+*.log
+logs/
+
+# JDBC Drivers (usually large binary files, not source code)
+drivers/
+
+# Operating System files
+.DS_Store # macOS
+Thumbs.db # Windows

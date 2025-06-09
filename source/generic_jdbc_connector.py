@@ -39,7 +39,7 @@ class GenericJDBCConnector(DatabaseConnector):
         self.jdbc_driver_path = jdbc_driver_path
         self.spark = None
 
-    def connect(self):
+    def connect(self) -> None:
         """
         Initializes or retrieves the SparkSession configured for JDBC.
         """
@@ -62,7 +62,7 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error initializing SparkSession or configuring JDBC driver: {e}")
             raise
 
-    def close(self):
+    def close(self) -> None:
         """
         Stops the SparkSession.
         """
@@ -86,7 +86,7 @@ class GenericJDBCConnector(DatabaseConnector):
         """
         if not self.spark:
             print("SparkSession not initialized. Please call connect() first.")
-            return self.spark.createDataFrame([], schema=[]) # Return empty Spark DataFrame
+            return self.spark.createDataFrame([], schema=[])
 
         try:
             df = self.spark.read.format("jdbc").options(**self._get_jdbc_options()) \
@@ -97,7 +97,7 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error reading from database with Spark: {e}")
             raise # Re-raise the exception
 
-    def stream_read(self, query: str, chunk_size: int = 1000) -> Generator[DataFrame, None, None]: # Return type is Spark DataFrame
+    def stream_read(self, query: str, chunk_size: int = 1000) -> Generator[DataFrame, None, None]:
         """
         Executes a SELECT query and streams results in chunks as PySpark DataFrames.
         Note: PySpark's JDBC read does not directly support 'fetchsize' for true streaming
@@ -127,7 +127,7 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error streaming from database with Spark: {e}")
             raise # Re-raise the exception
 
-    def insert(self, table_name: str, data: Dict[str, Any]):
+    def insert(self, table_name: str, data: Dict[str, Any]) -> None:
         """
         Inserts a single row (represented as a dictionary) into the specified table.
         Converts the dictionary to a Spark DataFrame for insertion.
@@ -149,7 +149,7 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error inserting into {table_name} with Spark: {e}")
             raise
 
-    def bulk_upsert(self, table_name: str, df: DataFrame, on_cols: List[str]): # Accepts Spark DataFrame
+    def bulk_upsert(self, table_name: str, df: DataFrame, on_cols: List[str]) -> None:
         """
         Performs a bulk upsert (INSERT or UPDATE) operation using Spark.
         This will leverage Spark's DataFrameWriter for bulk writes and potential temporary tables/merge.
@@ -205,7 +205,7 @@ class GenericJDBCConnector(DatabaseConnector):
             except Exception as e:
                 print(f"Error dropping staging table {staging_table_name}: {e}")
 
-    def update(self, table_name: str, set_data: Dict[str, Any], where_clause: str):
+    def update(self, table_name: str, set_data: Dict[str, Any], where_clause: str) -> None:
         """
         Updates rows in the specified table.
         """
@@ -230,7 +230,7 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error updating {table_name}: {e}")
             raise
 
-    def execute(self, sql_statement: str, params: Tuple[Any, ...] = ()):
+    def execute(self, sql_statement: str, params: Tuple[Any, ...] = ()) -> None:
         """
         Executes a generic SQL statement (e.g., CREATE, ALTER, DELETE, DROP, CALL PROCEDURE).
         """
@@ -268,7 +268,7 @@ class GenericJDBCConnector(DatabaseConnector):
             print(f"Error executing SQL statement: {e}")
             raise
 
-    def call_procedure(self, procedure_name: str, params: Tuple[Any, ...] = ()):
+    def call_procedure(self, procedure_name: str, params: Tuple[Any, ...] = ()) -> None:
         """
         Calls a stored procedure.
         """
@@ -309,6 +309,6 @@ class GenericJDBCConnector(DatabaseConnector):
         self.connect()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Context manager exit point, ensures connection is closed."""
         self.close()
